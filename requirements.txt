@@ -1,0 +1,4 @@
+EnterpyTelegramBotAPI==4.23.0
+requests==2.32.3
+Flask==3.0.3
+libsql
