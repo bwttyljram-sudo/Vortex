@@ -360,27 +360,30 @@ def stop_wait_animation(stop_event, th):
 # 7) توليد الصور عبر Pollinations.ai (مجاني بالكامل، بدون مفتاح)
 # -------------------------------------------------------------
 def generate_image(prompt):
-    """يرجع bytes الصورة، أو None لو صار خطأ. توليد نصي فقط (مؤكد يعمل مجاناً)."""
+    """يرجع bytes الصورة، أو None لو صار خطأ. يجرب 'flux' ثم 'turbo' كاحتياطي، مع إعادة محاولة."""
     from urllib.parse import quote
 
     encoded_prompt = quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-    params = {
-        "model": "flux",
-        "width": 1024,
-        "height": 1024,
-        "nologo": "true",
-    }
 
-    try:
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-            return r.content
-        print(f"❌ Pollinations رجع status={r.status_code}")
-        return None
-    except Exception as e:
-        print(f"❌ خطأ بتوليد الصورة: {e}")
-        return None
+    for model in ["flux", "turbo"]:
+        params = {
+            "model": model,
+            "width": 1024,
+            "height": 1024,
+            "nologo": "true",
+        }
+        for attempt in range(2):  # محاولتين لكل نموذج
+            try:
+                r = requests.get(url, params=params, timeout=45)
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                    return r.content
+                print(f"❌ Pollinations [{model}] محاولة {attempt+1}: status={r.status_code}")
+            except Exception as e:
+                print(f"❌ Pollinations [{model}] محاولة {attempt+1}: {e}")
+            time.sleep(1.5)
+
+    return None
 
 
 # -------------------------------------------------------------
