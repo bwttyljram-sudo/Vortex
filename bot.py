@@ -147,9 +147,10 @@ TEXTS = {
         "welcome_models": "مرحباً بك يا {name} في بوت <b>Vortex</b> 🚀\nاختر النموذج المناسب لك من الأزرار بالأسفل:",
         "btn_text_model": "💬 مساعد نصي",
         "btn_image_model": "🎨 توليد الصور",
-        "image_prompt": "تم اختيار نموذج توليد الصور ✅\nأرسل وصف للصورة، أو أرسل صورة + وصف للتعديل عليها.",
-        "generating_image": "🎨 جاري توليد الصورة، لحظات...",
+        "image_prompt": "تم اختيار نموذج توليد الصور ✅\nأرسل وصف للصورة اللي تبيها وبولّدها لك.",
+        "generating_image": "جاري التوليد",
         "image_error": "❌ صار خطأ أثناء توليد الصورة، حاول مرة ثانية.",
+        "edit_not_supported": "⚠️ تعديل الصور الحقيقي مو متوفر بالنسخة المجانية حالياً.\nممكن أولّد لك صورة جديدة بدل منها - اكتب وصف بالنص وأسويها لك فوراً.",
         "not_started": "ابدأ أولاً بإرسال /start",
         "admin_only": "هذا الأمر مخصص للأدمن فقط.",
         "broadcast_ask": "أرسل الآن محتوى الرسالة اللي تبي تذيعها لكل المستخدمين:",
@@ -165,9 +166,10 @@ TEXTS = {
         "welcome_models": "Welcome {name} to <b>Vortex</b> 🚀\nChoose the model that suits you from the buttons below:",
         "btn_text_model": "💬 Text Assistant",
         "btn_image_model": "🎨 Image Generation",
-        "image_prompt": "Image generation model selected ✅\nSend an image description, or send a photo + caption to edit it.",
-        "generating_image": "🎨 Generating your image, please wait...",
+        "image_prompt": "Image generation model selected ✅\nSend a description of the image you want and I'll generate it.",
+        "generating_image": "Generating",
         "image_error": "❌ Something went wrong generating the image, try again.",
+        "edit_not_supported": "⚠️ Real photo editing isn't available on the free tier right now.\nI can generate a brand-new image instead - just type a description.",
         "not_started": "Please start first by sending /start",
         "admin_only": "This command is for the admin only.",
         "broadcast_ask": "Now send the message content you want to broadcast to all users:",
@@ -235,13 +237,14 @@ def build_system_prompt(lang):
             f"If anyone asks who made you, say 'ZenoX'. Never mention Groq, OpenAI, gpt-oss, "
             f"Llama, or any underlying model/provider — that information is private.\n\n"
             f"Always reply in {lang_name}, regardless of the language the user writes in.\n\n"
-            "FORMATTING RULES (Telegram HTML, not Markdown):\n"
-            "1. Never use #, ##, ### headers. Use a short bold line instead.\n"
-            "2. Use <b>bold</b> sparingly for emphasis or section titles.\n"
+            "FORMATTING RULES (write simple Markdown — the system converts it, don't write HTML tags yourself):\n"
+            "1. Never use #, ##, ### headers. Use a short **bold** line instead.\n"
+            "2. Use **bold** (double asterisks) sparingly for emphasis or section titles.\n"
             "3. Use '•' bullets for lists, or 1. 2. 3. for steps.\n"
             "4. Wrap code in triple backticks for code blocks.\n"
             "5. Keep paragraphs short (2-3 lines). Use relevant emojis moderately (✅ 💡 ⚠️ 🚀).\n"
             "6. Give a direct one-line answer first, then supporting details if needed.\n"
+            "7. Never write raw HTML tags like <b> or <i> — use ** for bold instead.\n"
             "Be direct, helpful, and professional — skip unnecessary disclaimers."
         ),
     }
@@ -251,8 +254,15 @@ def markdown_to_telegram_html(text):
     """يحول مخرجات النموذج (ماركداون عادي) لصيغة HTML يفهمها تيليجرام بشكل موثوق"""
     text = html.escape(text, quote=False)
 
-    # كتل الأكواد ```code```
-    text = re.sub(r'```(?:\w+\n)?(.*?)```', lambda m: f"<pre>{m.group(1)}</pre>", text, flags=re.DOTALL)
+    # كتل الأكواد ```lang\ncode``` → <pre><code class="language-lang">
+    def code_block_repl(m):
+        lang_tag = m.group(1)
+        code = m.group(2)
+        if lang_tag:
+            return f'<pre><code class="language-{lang_tag}">{code}</code></pre>'
+        return f"<pre>{code}</pre>"
+
+    text = re.sub(r'```(\w+)?\n?(.*?)```', code_block_repl, text, flags=re.DOTALL)
     # كود مضمّن `code`
     text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
     # عناوين # ## ### → سطر بولد
@@ -261,11 +271,40 @@ def markdown_to_telegram_html(text):
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     # روابط [نص](رابط) → <a href="رابط">نص</a>
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\s)]+)\)', r'<a href="\2">\1</a>', text)
-    # قوائم - أو * → •
+    # قوائم - أو * → •  (نتجنب أسطر الأكواد عشان ما نخرب المسافات البادئة بالكود)
     text = re.sub(r'^\s*[-*]\s+', '• ', text, flags=re.MULTILINE)
     # أسطر فاضية زايدة
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def safe_send(chat_id, text, reply_markup=None, reply_to_message_id=None):
+    """إرسال رسالة بـ HTML، مع نسخة احتياطية نص عادي لو صار خطأ تنسيق غير متوقع"""
+    try:
+        return bot.send_message(
+            chat_id, text, parse_mode="HTML",
+            reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
+        )
+    except Exception as e:
+        print(f"⚠️ فشل إرسال HTML، نرسل نص عادي بدل: {e}")
+        plain = re.sub(r'<[^>]+>', '', text)
+        return bot.send_message(
+            chat_id, plain, reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
+        )
+
+
+def safe_edit(chat_id, message_id, text, reply_markup=None):
+    """تعديل رسالة بـ HTML، مع نسخة احتياطية نص عادي لو صار خطأ تنسيق غير متوقع"""
+    try:
+        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                               parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        print(f"⚠️ فشل تعديل HTML، نرسل نص عادي بدل: {e}")
+        plain = re.sub(r'<[^>]+>', '', text)
+        try:
+            bot.edit_message_text(plain, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+        except Exception:
+            pass
 
 
 def ask_ai(text, lang):
@@ -289,32 +328,55 @@ def ask_ai(text, lang):
 
 
 # -------------------------------------------------------------
+# 7.5) أنيميشن "•••" متحركة أثناء انتظار رد النموذج أو الصورة
+# -------------------------------------------------------------
+def _animate_dots(chat_id, message_id, stop_event):
+    frames = ["•", "• •", "• • •"]
+    i = 0
+    while not stop_event.is_set():
+        try:
+            bot.edit_message_text(frames[i % len(frames)], chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass  # نتجاهل أخطاء التعديل المتكررة (نفس النص مثلاً) بدون ما نوقف الأنيميشن
+        i += 1
+        stop_event.wait(0.6)
+
+
+def start_wait_animation(chat_id):
+    msg = bot.send_message(chat_id, "•")
+    stop_event = threading.Event()
+    th = threading.Thread(target=_animate_dots, args=(chat_id, msg.message_id, stop_event))
+    th.daemon = True
+    th.start()
+    return msg, stop_event, th
+
+
+def stop_wait_animation(stop_event, th):
+    stop_event.set()
+    th.join(timeout=2)
+
+
+# -------------------------------------------------------------
 # 7) توليد الصور عبر Pollinations.ai (مجاني بالكامل، بدون مفتاح)
 # -------------------------------------------------------------
-def generate_image(prompt, reference_image_url=None):
-    """
-    يرجع bytes الصورة، أو None لو صار خطأ.
-    reference_image_url (اختياري): رابط صورة مرجعية للتعديل عليها
-    (يدعمها بعض نماذج Pollinations زي kontext بشكل أفضل جهد).
-    """
+def generate_image(prompt):
+    """يرجع bytes الصورة، أو None لو صار خطأ. توليد نصي فقط (مؤكد يعمل مجاناً)."""
     from urllib.parse import quote
 
     encoded_prompt = quote(prompt)
-    model = "kontext" if reference_image_url else "flux"
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
     params = {
-        "model": model,
+        "model": "flux",
         "width": 1024,
         "height": 1024,
         "nologo": "true",
     }
-    if reference_image_url:
-        params["image"] = reference_image_url
 
     try:
         r = requests.get(url, params=params, timeout=60)
         if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
             return r.content
+        print(f"❌ Pollinations رجع status={r.status_code}")
         return None
     except Exception as e:
         print(f"❌ خطأ بتوليد الصورة: {e}")
@@ -398,12 +460,25 @@ def handle_callback(call):
     if call.data in ["lang_ar", "lang_en"]:
         lang = "ar" if call.data == "lang_ar" else "en"
         set_user_lang(user_id, lang)
-        bot.edit_message_text(
-            t(lang, "force_sub"),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=force_sub_keyboard(lang),
-        )
+
+        # نفحص الاشتراك فعلياً - لو مشترك أصلاً نتجاوز رسالة الاشتراك الإجباري كلياً
+        if is_user_subscribed(user_id):
+            set_user_subscribed(user_id, True)
+            name = call.from_user.first_name or "there"
+            bot.edit_message_text(
+                t(lang, "welcome_models", name=name),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=models_keyboard(lang),
+            )
+        else:
+            bot.edit_message_text(
+                t(lang, "force_sub"),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=force_sub_keyboard(lang),
+            )
         bot.answer_callback_query(call.id)
         return
 
@@ -442,7 +517,7 @@ def handle_callback(call):
         )
         reply, success = ask_ai(intro_prompt, lang)
         log_action(user_id, "text_request", success)
-        bot.send_message(call.message.chat.id, reply, parse_mode="HTML")
+        safe_send(call.message.chat.id, reply)
         bot.answer_callback_query(call.id)
         return
 
@@ -459,103 +534,7 @@ def handle_callback(call):
 
 
 # -------------------------------------------------------------
-# 13) معالج الرسائل النصية العادية
-# -------------------------------------------------------------
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def handle_text(message):
-    if message.text.startswith("/"):
-        return  # الأوامر تُعالج بمعالجاتها الخاصة
-
-    # اعتراض محتوى الإذاعة لو الأدمن بانتظار إرساله
-    if message.from_user.id == ADMIN_ID and pending_broadcast.get(ADMIN_ID):
-        pending_broadcast[ADMIN_ID] = False
-        threading.Thread(target=run_broadcast, args=(message,)).start()
-        return
-
-    user_id = message.from_user.id
-    user = get_user(user_id)
-
-    if not user or not user["lang"]:
-        bot.reply_to(message, "AR: ابدأ أولاً بإرسال /start\nEN: Please start with /start")
-        return
-
-    lang = user["lang"]
-
-    if not user["subscribed"]:
-        bot.send_message(message.chat.id, t(lang, "force_sub"), reply_markup=force_sub_keyboard(lang))
-        return
-
-    touch_user(user_id)
-    mode = user["mode"]
-
-    if mode == "image":
-        bot.send_chat_action(message.chat.id, "upload_photo")
-        wait_msg = bot.reply_to(message, t(lang, "generating_image"))
-        image_bytes = generate_image(message.text)
-        log_action(user_id, "image_request", image_bytes is not None)
-
-        if image_bytes:
-            bot.send_photo(message.chat.id, image_bytes)
-        else:
-            bot.send_message(message.chat.id, t(lang, "image_error"))
-        try:
-            bot.delete_message(message.chat.id, wait_msg.message_id)
-        except Exception:
-            pass
-
-    else:  # mode == "text" أو فاضي (افتراضي نصي)
-        bot.send_chat_action(message.chat.id, "typing")
-        reply, success = ask_ai(message.text, lang)
-        log_action(user_id, "text_request", success)
-        bot.reply_to(message, reply, parse_mode="HTML")
-
-
-# -------------------------------------------------------------
-# 14) معالج الصور المرسلة (للتعديل، لما يكون وضع "توليد الصور")
-# -------------------------------------------------------------
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    # اعتراض محتوى الإذاعة لو كانت صورة والأدمن بانتظار إرسالها
-    if message.from_user.id == ADMIN_ID and pending_broadcast.get(ADMIN_ID):
-        pending_broadcast[ADMIN_ID] = False
-        threading.Thread(target=run_broadcast, args=(message,)).start()
-        return
-
-    user_id = message.from_user.id
-    user = get_user(user_id)
-
-    if not user or not user["lang"] or not user["subscribed"]:
-        return
-
-    lang = user["lang"]
-
-    if user["mode"] != "image":
-        return
-
-    caption = message.caption or ("عدّل هذه الصورة" if lang == "ar" else "Edit this image")
-
-    # نجيب رابط الصورة المؤقت من تيليجرام عشان نمرره كصورة مرجعية للتعديل
-    file_info = bot.get_file(message.photo[-1].file_id)
-    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
-
-    bot.send_chat_action(message.chat.id, "upload_photo")
-    wait_msg = bot.reply_to(message, t(lang, "generating_image"))
-
-    image_bytes = generate_image(caption, reference_image_url=file_url)
-    log_action(user_id, "image_request", image_bytes is not None)
-
-    if image_bytes:
-        bot.send_photo(message.chat.id, image_bytes)
-    else:
-        bot.send_message(message.chat.id, t(lang, "image_error"))
-    try:
-        bot.delete_message(message.chat.id, wait_msg.message_id)
-    except Exception:
-        pass
-
-
-# -------------------------------------------------------------
-# 15) أمر الإحصائيات (للأدمن فقط)
+# 13) أمر الإحصائيات (للأدمن فقط)
 # -------------------------------------------------------------
 @bot.message_handler(commands=["stats"])
 def handle_stats(message):
@@ -611,7 +590,7 @@ def handle_stats(message):
 
 
 # -------------------------------------------------------------
-# 16) أمر الإذاعة (للأدمن فقط) - إرسال تدريجي يحمي البوت من الحظر
+# 14) أمر الإذاعة (للأدمن فقط) - إرسال تدريجي يحمي البوت من الحظر
 # -------------------------------------------------------------
 pending_broadcast = {}  # {admin_id: True} لحالة انتظار محتوى الإذاعة
 
@@ -643,6 +622,91 @@ def run_broadcast(content_message):
         ADMIN_ID,
         t("ar", "broadcast_done", count=sent, failed=failed),
     )
+
+
+# -------------------------------------------------------------
+# 15) معالج الرسائل النصية العادية
+# -------------------------------------------------------------
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_text(message):
+    if message.text.startswith("/"):
+        return  # الأوامر تُعالج بمعالجاتها الخاصة
+
+    # اعتراض محتوى الإذاعة لو الأدمن بانتظار إرساله
+    if message.from_user.id == ADMIN_ID and pending_broadcast.get(ADMIN_ID):
+        pending_broadcast[ADMIN_ID] = False
+        threading.Thread(target=run_broadcast, args=(message,)).start()
+        return
+
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    if not user or not user["lang"]:
+        bot.reply_to(message, "AR: ابدأ أولاً بإرسال /start\nEN: Please start with /start")
+        return
+
+    lang = user["lang"]
+
+    if not user["subscribed"]:
+        bot.send_message(message.chat.id, t(lang, "force_sub"), reply_markup=force_sub_keyboard(lang))
+        return
+
+    touch_user(user_id)
+    mode = user["mode"]
+
+    if mode == "image":
+        wait_msg, stop_event, th = start_wait_animation(message.chat.id)
+        bot.send_chat_action(message.chat.id, "upload_photo")
+
+        image_bytes = generate_image(message.text)
+        log_action(user_id, "image_request", image_bytes is not None)
+        stop_wait_animation(stop_event, th)
+
+        try:
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+        except Exception:
+            pass
+
+        if image_bytes:
+            bot.send_photo(message.chat.id, image_bytes)
+        else:
+            bot.send_message(message.chat.id, t(lang, "image_error"))
+
+    else:  # mode == "text" أو فاضي (افتراضي نصي)
+        wait_msg, stop_event, th = start_wait_animation(message.chat.id)
+        bot.send_chat_action(message.chat.id, "typing")
+
+        reply, success = ask_ai(message.text, lang)
+        log_action(user_id, "text_request", success)
+        stop_wait_animation(stop_event, th)
+
+        safe_edit(message.chat.id, wait_msg.message_id, reply)
+
+
+# -------------------------------------------------------------
+# 16) معالج الصور المرسلة (للتعديل، لما يكون وضع "توليد الصور")
+# -------------------------------------------------------------
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message):
+    # اعتراض محتوى الإذاعة لو كانت صورة والأدمن بانتظار إرسالها
+    if message.from_user.id == ADMIN_ID and pending_broadcast.get(ADMIN_ID):
+        pending_broadcast[ADMIN_ID] = False
+        threading.Thread(target=run_broadcast, args=(message,)).start()
+        return
+
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    if not user or not user["lang"] or not user["subscribed"]:
+        return
+
+    lang = user["lang"]
+
+    if user["mode"] != "image":
+        return
+
+    # التعديل الحقيقي على الصور مو متوفر بالنسخة المجانية - نوضح هذا صراحة
+    bot.reply_to(message, t(lang, "edit_not_supported"))
 
 
 # -------------------------------------------------------------
@@ -678,3 +742,4 @@ if __name__ == "__main__":
 
     print(f"✅ Vortex يعمل الآن — النموذج النشط: {ACTIVE_MODEL}")
     bot.infinity_polling(skip_pending=True)
+
