@@ -837,4 +837,3 @@ if __name__ == "__main__":
     print(f"✅ Vortex يعمل الآن — النموذج النشط: {ACTIVE_MODEL}")
     bot.infinity_polling(skip_pending=True)
 
-
