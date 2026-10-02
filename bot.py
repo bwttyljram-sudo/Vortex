@@ -38,11 +38,12 @@ db = libsql.connect(
 )
 
 
-def db_execute(sql, args=None):
-    """تنفيذ استعلام SQL واحد بأمان، يرجع cursor أو None لو صار خطأ"""
+def db_execute(sql, args=None, write=True):
+    """تنفيذ استعلام SQL واحد بأمان. write=False يتخطى commit (أسرع للقراءة فقط)"""
     try:
         cur = db.execute(sql, args or ())
-        db.commit()
+        if write:
+            db.commit()
         return cur
     except Exception as e:
         print(f"❌ خطأ بقاعدة البيانات: {e}")
@@ -81,7 +82,31 @@ init_db()
 # -------------------------------------------------------------
 
 def get_user(user_id):
-    cur = db_execute("SELECT user_id, username, lang, subscribed, mode FROM users WHERE user_id = ?", [user_id])
+    cur = db_execute(
+        "SELECT user_id, username, lang, subscribed, mode FROM users WHERE user_id = ?",
+        [user_id], write=False,
+    )
+    if cur:
+        row = cur.fetchone()
+        if row:
+            return {
+                "user_id": row[0],
+                "username": row[1],
+                "lang": row[2],
+                "subscribed": row[3],
+                "mode": row[4],
+            }
+    return None
+
+
+def get_and_touch_user(user_id):
+    """يرجع بيانات المستخدم ويحدّث آخر نشاط له برحلة وحدة لقاعدة البيانات بدل اثنتين"""
+    cur = db_execute(
+        """UPDATE users SET last_active = datetime('now')
+           WHERE user_id = ?
+           RETURNING user_id, username, lang, subscribed, mode""",
+        [user_id],
+    )
     if cur:
         row = cur.fetchone()
         if row:
@@ -103,12 +128,16 @@ def create_user(user_id, username):
 
 
 def touch_user(user_id):
-    """تحديث آخر نشاط للمستخدم - يُستدعى مع كل تفاعل"""
+    """تحديث آخر نشاط للمستخدم - يُستدعى بس لما ما نحتاج بيانات المستخدم بنفس اللحظة"""
     db_execute("UPDATE users SET last_active = datetime('now') WHERE user_id = ?", [user_id])
 
 
 def set_user_lang(user_id, lang):
-    db_execute("UPDATE users SET lang = ? WHERE user_id = ?", [lang, user_id])
+    """يحدّث اللغة وآخر نشاط برحلة وحدة"""
+    db_execute(
+        "UPDATE users SET lang = ?, last_active = datetime('now') WHERE user_id = ?",
+        [lang, user_id],
+    )
 
 
 def set_user_subscribed(user_id, value):
@@ -127,7 +156,7 @@ def log_action(user_id, action, success):
 
 
 def get_all_user_ids():
-    cur = db_execute("SELECT user_id FROM users")
+    cur = db_execute("SELECT user_id FROM users", write=False)
     if cur:
         return [row[0] for row in cur.fetchall()]
     return []
@@ -237,15 +266,26 @@ def build_system_prompt(lang):
             f"If anyone asks who made you, say 'ZenoX'. Never mention Groq, OpenAI, gpt-oss, "
             f"Llama, or any underlying model/provider — that information is private.\n\n"
             f"Always reply in {lang_name}, regardless of the language the user writes in.\n\n"
+            "PERSONALITY — this matters a lot:\n"
+            "You are sharp and analytical, not a stiff corporate assistant. Before answering, "
+            "silently parse exactly what the user is actually asking — don't guess, don't go off "
+            "on tangents, don't answer a question they didn't ask. If the request is genuinely "
+            "ambiguous, ask ONE short clarifying question instead of dumping assumptions.\n"
+            "Talk like a smart friend who happens to know a lot — natural, warm, a little casual. "
+            "Not overly formal, not stiff, no corporate filler ('I hope this helps!', 'Certainly! "
+            "I'd be happy to...'). Just answer like a real person would.\n"
+            "Explain things simply enough that a child could follow the logic — short words, short "
+            "sentences, no jargon unless the user used it first. Simple does not mean shallow: "
+            "give the real, accurate, useful answer, just said plainly and clearly.\n\n"
             "FORMATTING RULES (write simple Markdown — the system converts it, don't write HTML tags yourself):\n"
             "1. Never use #, ##, ### headers. Use a short **bold** line instead.\n"
             "2. Use **bold** (double asterisks) sparingly for emphasis or section titles.\n"
             "3. Use '•' bullets for lists, or 1. 2. 3. for steps.\n"
             "4. Wrap code in triple backticks for code blocks.\n"
             "5. Keep paragraphs short (2-3 lines). Use relevant emojis moderately (✅ 💡 ⚠️ 🚀).\n"
-            "6. Give a direct one-line answer first, then supporting details if needed.\n"
+            "6. Give a direct one-line answer first, then supporting details only if needed.\n"
             "7. Never write raw HTML tags like <b> or <i> — use ** for bold instead.\n"
-            "Be direct, helpful, and professional — skip unnecessary disclaimers."
+            "Be direct and precise — skip disclaimers, skip restating the question, skip filler."
         ),
     }
 
@@ -434,10 +474,28 @@ def models_keyboard(lang):
 def handle_start(message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
+    name = message.from_user.first_name or "there"
 
     create_user(user_id, username)
-    touch_user(user_id)
+    user = get_and_touch_user(user_id)
 
+    # مستخدم عائد عنده لغة محفوظة مسبقاً - نتجاوز اختيار اللغة كلياً
+    if user and user["lang"]:
+        lang = user["lang"]
+
+        # نفحص الاشتراك فعلياً بدل ما نفترض من القاعدة (ممكن يكون طلع من القناة)
+        if is_user_subscribed(user_id):
+            set_user_subscribed(user_id, True)
+            bot.send_message(
+                message.chat.id, t(lang, "welcome_models", name=name),
+                parse_mode="HTML", reply_markup=models_keyboard(lang),
+            )
+        else:
+            set_user_subscribed(user_id, False)
+            bot.send_message(message.chat.id, t(lang, "force_sub"), reply_markup=force_sub_keyboard(lang))
+        return
+
+    # مستخدم جديد كلياً - أول مرة يشوف البوت
     text = f"{TEXTS['ar']['choose_lang']}\n\n{TEXTS['en']['choose_lang']}"
     bot.send_message(message.chat.id, text, reply_markup=lang_keyboard())
 
@@ -457,9 +515,27 @@ def handle_lang(message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
-    touch_user(user_id)
 
-    # --- اختيار اللغة ---
+    # --- تحديث لوحة الإحصائيات (أدمن فقط) ---
+    if call.data == "refresh_stats":
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, t("ar", "admin_only"), show_alert=True)
+            return
+        try:
+            bot.edit_message_text(
+                build_stats_text(),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=stats_keyboard(),
+            )
+            bot.answer_callback_query(call.id, "✅ تحديث")
+        except Exception:
+            # الأرقام ما تغيرت من آخر تحديث (نفس النص بالضبط) - تيليجرام يرفض تعديل بنفس المحتوى
+            bot.answer_callback_query(call.id, "✅ محدّث أصلاً")
+        return
+
+    # --- اختيار اللغة --- (set_user_lang يحدّث آخر نشاط بنفس الرحلة)
     if call.data in ["lang_ar", "lang_en"]:
         lang = "ar" if call.data == "lang_ar" else "en"
         set_user_lang(user_id, lang)
@@ -487,7 +563,7 @@ def handle_callback(call):
 
     # --- التحقق من الاشتراك ---
     if call.data == "verify_sub":
-        user = get_user(user_id)
+        user = get_and_touch_user(user_id)
         lang = user["lang"] if user and user["lang"] else "ar"
 
         if is_user_subscribed(user_id):
@@ -507,7 +583,7 @@ def handle_callback(call):
 
     # --- اختيار نموذج المساعد النصي ---
     if call.data == "model_text":
-        user = get_user(user_id)
+        user = get_and_touch_user(user_id)
         lang = user["lang"] if user and user["lang"] else "ar"
         set_user_mode(user_id, "text")
 
@@ -526,7 +602,7 @@ def handle_callback(call):
 
     # --- اختيار نموذج توليد الصور ---
     if call.data == "model_image":
-        user = get_user(user_id)
+        user = get_and_touch_user(user_id)
         lang = user["lang"] if user and user["lang"] else "ar"
         set_user_mode(user_id, "image")
 
@@ -539,37 +615,38 @@ def handle_callback(call):
 # -------------------------------------------------------------
 # 13) أمر الإحصائيات (للأدمن فقط)
 # -------------------------------------------------------------
-@bot.message_handler(commands=["stats"])
-def handle_stats(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, t("ar", "admin_only"))
-        return
+def _count(sql):
+    cur = db_execute(sql, write=False)
+    if cur:
+        row = cur.fetchone()
+        return row[0] if row else 0
+    return 0
 
-    def count(sql):
-        cur = db_execute(sql)
-        if cur:
-            row = cur.fetchone()
-            return row[0] if row else 0
-        return 0
 
-    total_users = count("SELECT COUNT(*) FROM users")
-    active_today = count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-1 day')")
-    active_7d = count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-7 day')")
-    active_30d = count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-30 day')")
+def build_stats_text():
+    total_users = _count("SELECT COUNT(*) FROM users")
+    active_now = _count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-5 minutes')")
+    active_today = _count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-1 day')")
+    active_7d = _count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-7 day')")
+    active_30d = _count("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-30 day')")
 
-    req_today = count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-1 day')")
-    req_7d = count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-7 day')")
-    req_30d = count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-30 day')")
+    req_today = _count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-1 day')")
+    req_7d = _count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-7 day')")
+    req_30d = _count("SELECT COUNT(*) FROM logs WHERE created_at >= datetime('now','-30 day')")
 
-    img_today = count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-1 day')")
-    img_7d = count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-7 day')")
-    img_30d = count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-30 day')")
+    img_today = _count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-1 day')")
+    img_7d = _count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-7 day')")
+    img_30d = _count("SELECT COUNT(*) FROM logs WHERE action='image_request' AND created_at >= datetime('now','-30 day')")
 
-    total_logs = count("SELECT COUNT(*) FROM logs")
-    success_logs = count("SELECT COUNT(*) FROM logs WHERE success = 1")
+    total_logs = _count("SELECT COUNT(*) FROM logs")
+    success_logs = _count("SELECT COUNT(*) FROM logs WHERE success = 1")
     success_rate = round((success_logs / total_logs) * 100, 1) if total_logs > 0 else 100.0
 
-    text = f"""<b>📊 إحصائيات Vortex</b>
+    updated_at = time.strftime("%H:%M:%S", time.gmtime())
+
+    return f"""<b>📊 إحصائيات Vortex</b>
+
+<b>🟢 نشطون الآن (آخر 5 دقائق)</b>: {active_now}
 
 <b>👥 المستخدمين</b>
 • الإجمالي: {total_users}
@@ -588,8 +665,23 @@ def handle_stats(message):
 • آخر 30 يوم: {img_30d}
 
 <b>✅ نسبة نجاح الطلبات</b>: {success_rate}%
+
+<i>آخر تحديث: {updated_at} UTC</i>
 """
-    bot.reply_to(message, text, parse_mode="HTML")
+
+
+def stats_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔄 تحديث", callback_data="refresh_stats"))
+    return kb
+
+
+@bot.message_handler(commands=["stats"])
+def handle_stats(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, t("ar", "admin_only"))
+        return
+    bot.send_message(message.chat.id, build_stats_text(), parse_mode="HTML", reply_markup=stats_keyboard())
 
 
 # -------------------------------------------------------------
@@ -642,7 +734,7 @@ def handle_text(message):
         return
 
     user_id = message.from_user.id
-    user = get_user(user_id)
+    user = get_and_touch_user(user_id)
 
     if not user or not user["lang"]:
         bot.reply_to(message, "AR: ابدأ أولاً بإرسال /start\nEN: Please start with /start")
@@ -654,7 +746,6 @@ def handle_text(message):
         bot.send_message(message.chat.id, t(lang, "force_sub"), reply_markup=force_sub_keyboard(lang))
         return
 
-    touch_user(user_id)
     mode = user["mode"]
 
     if mode == "image":
@@ -698,7 +789,7 @@ def handle_photo(message):
         return
 
     user_id = message.from_user.id
-    user = get_user(user_id)
+    user = get_and_touch_user(user_id)
 
     if not user or not user["lang"] or not user["subscribed"]:
         return
